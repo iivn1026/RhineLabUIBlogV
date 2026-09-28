@@ -1,0 +1,39 @@
+{
+  "name": "rhine-lab-analysis-os",
+  "version": "1.0.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "check": "node scripts/check-all.mjs",
+    "check:content": "node --test scripts/check-content.mjs",
+    "release": "npm run check && npm run build && node scripts/package-release.mjs",
+    "backup": "node server/maintenance.mjs backup",
+    "test:reader": "npm run build && node scripts/check-reader-browser.mjs",
+    "build": "tsc && vite build",
+    "format": "prettier --write src scripts index.html package.json tsconfig.json",
+    "preview": "node server/app.mjs",
+    "start": "node server/app.mjs",
+    "user:add": "node server/create-user.mjs",
+    "test:server": "node --test server/*.test.mjs",
+    "test:accounts": "npm run build && node scripts/check-account-browser.mjs"
+  },
+  "dependencies": {
+    "@kitlangton/rolling-number": "0.4.1",
+    "dompurify": "^3.4.16",
+    "marked": "^18.0.14",
+    "three": "^0.183.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/three": "^0.183.0",
+    "jsdom": "^30.1.1",
+    "prettier": "^3.9.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  }
+}

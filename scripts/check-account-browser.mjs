@@ -1,0 +1,62 @@
+const initialPassword = randomBytes(24).toString("hex"), readerPassword = randomBytes(24).toString("hex"), adminPassword = randomBytes(24).toString("hex");
+import { randomBytes } from "node:crypto";
+import assert from 'node:assert/strict';
+import { chromium, expect } from '@playwright/test';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { openStore, createUser, verifyPassword } from '../server/store.mjs';
+import { createApp } from '../server/app.mjs';
+import { populateTestStore } from '../server/fixtures/records.mjs';
+const dir=await mkdtemp(join(tmpdir(),'rhine-account-ui-'));
+const db=openStore(join(dir,'test.sqlite'));populateTestStore(db);
+for(const [name,role] of [['admin','admin'],['reader','reader'],['other','reader']])createUser(db,name,initialPassword,role);
+const app=createApp({db});await new Promise(r=>app.listen(0,'127.0.0.1',r));
+const base=`http://127.0.0.1:${app.address().port}`;
+const browser=await chromium.launch({executablePath:process.env.BROWSER_EXECUTABLE,headless:true,args:['--enable-unsafe-swiftshader']});
+const errors=[];
+const context=await browser.newContext({viewport:{width:1600,height:1000},reducedMotion:'reduce'});
+const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
+async function enter(name,password=initialPassword){
+ await page.goto(base+'/?scene=archive');
+ if(name==='guest')await page.locator('[data-guest]').click();
+ else{await page.locator('.access-gate [name="username"]').fill(name);await page.locator('.access-gate [name="password"]').fill(password);await page.locator('.access-gate button[type="submit"]').click();}
+ await page.locator('#loading').waitFor({state:'detached',timeout:45000});
+}
+try{
+ await enter('reader');
+ await expect(page.locator('[data-action="manage-accounts"]')).not.toBeVisible();
+ await page.locator('.read-file').click();
+ await page.locator('[data-action="bookmark"]').click();
+ await expect(page.locator('[data-action="bookmark"]')).toHaveAttribute('aria-pressed','true');
+ await page.locator('[data-action="saved"]').click();
+ await expect(page.locator('.result-row')).toHaveCount(1);
+ await enter('reader');await page.locator('[data-action="saved"]').click();await expect(page.locator('.result-row')).toHaveCount(1);
+ await enter('other');await page.locator('[data-action="saved"]').click();await expect(page.locator('.result-row')).toHaveCount(0);
+ await enter('guest');await expect(page.locator('[data-action="saved"]')).not.toBeVisible();await expect(page.locator('[data-action="manage-accounts"]')).not.toBeVisible();
+ await enter('admin');await page.locator('[data-action="manage-accounts"]').click();
+ await expect(page.locator('.account-list li')).toHaveCount(3);
+ await page.locator('.account-list li').filter({has:page.getByText('reader',{exact:true})}).getByRole('button',{name:'重置密码'}).click();
+ await page.locator('[name="newPassword"]').fill(readerPassword);await page.locator('[name="confirmPassword"]').fill('mismatch-password');
+ await page.getByRole('button',{name:'保存新密码'}).click();await expect(page.locator('.account-manager .access-error')).toHaveText('两次输入的新密码不一致。');
+ await page.locator('[name="confirmPassword"]').fill(readerPassword);await page.getByRole('button',{name:'保存新密码'}).click();
+ await expect(page.locator('.account-manager .reader-result')).toContainText('已更新 reader');
+ assert.ok(verifyPassword(readerPassword,db.prepare("SELECT password_hash FROM users WHERE username='reader'").get().password_hash));
+ await page.getByRole('button',{name:'修改我的密码'}).click();
+ await page.locator('[name="currentPassword"]').fill('wrong-password');await page.locator('[name="newPassword"]').fill(adminPassword);await page.locator('[name="confirmPassword"]').fill(adminPassword);
+ await page.getByRole('button',{name:'保存新密码'}).click();await expect(page.locator('.account-manager .access-error')).toHaveText('当前密码不正确。');
+ await page.locator('[name="currentPassword"]').fill(initialPassword);await page.getByRole('button',{name:'保存新密码'}).click();
+ await expect(page.locator('.account-manager .reader-result')).toContainText('已更新 admin');
+ await page.locator('.account-list li').filter({has:page.getByText('other',{exact:true})}).getByRole('button',{name:'删除账户'}).click();
+ await page.locator('[name="confirmUsername"]').fill('reader');await page.getByRole('button',{name:'确认删除账户'}).click();await expect(page.locator('.account-manager .access-error')).toHaveText('账户名称不匹配。');
+ await page.locator('[name="confirmUsername"]').fill('other');await page.getByRole('button',{name:'确认删除账户'}).click();await expect(page.locator('.account-list li')).toHaveCount(2);
+ assert.equal(db.prepare("SELECT COUNT(*) AS n FROM records").get().n,40);
+ await page.setViewportSize({width:390,height:844});
+ const box=await page.locator('.account-manager').boundingBox();assert.ok(box.width<=390 && box.height<=844);
+ await page.keyboard.press('Escape');await expect(page.locator('[data-action="manage-accounts"]')).toBeFocused();
+ await enter('admin',adminPassword);await expect(page.locator('[data-action="manage-accounts"]')).toBeVisible();
+ await enter('reader',readerPassword);await page.locator('.read-file').click();await expect(page.locator('[data-action="bookmark"]')).toHaveAttribute('aria-pressed','true');
+ await page.locator('[data-action="bookmark"]').click();await expect(page.locator('[data-action="bookmark"]')).toHaveAttribute('aria-pressed','false');
+ assert.deepEqual(errors,[]);
+ console.log('Account UI passed: reader bookmarks persist and isolate accounts, guest restrictions, admin password validation/reset/delete, desktop/mobile and focus.');
+}finally{await browser.close();app.closeAllConnections();await new Promise(r=>app.close(r));db.close();await rm(dir,{recursive:true,force:true});}

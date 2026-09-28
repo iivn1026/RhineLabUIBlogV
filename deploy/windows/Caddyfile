@@ -1,0 +1,21 @@
+{
+    admin off
+    persist_config off
+    storage file_system {
+        root C:/ProgramData/RhineBlogProxy/certificates
+    }
+    log default {
+        output file C:/ProgramData/RhineBlogProxy/logs/runtime.log {
+            roll_size 10MiB
+            roll_keep 5
+        }
+    }
+}
+
+example.com {
+    encode zstd gzip
+    request_body {
+        max_size 10MB
+    }
+    reverse_proxy 127.0.0.1:4173
+}

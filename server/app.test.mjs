@@ -1,0 +1,104 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { createApp } from "./app.mjs";
+import { openStore, createUser, listRecords } from "./store.mjs";
+import { fixture as seed, populateTestStore } from "./fixtures/records.mjs";
+
+test("authentication, role boundaries, CSRF, persistence and conflicts", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rhine-auth-"));
+  let db = openStore(join(dir, "test.sqlite"));
+  populateTestStore(db);
+  const password = randomBytes(20).toString("hex");
+  createUser(db, "testadmin", password, "admin");
+  let origin, tick = Date.now();
+  let server = createApp({ db, now: () => tick });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  origin = `http://127.0.0.1:${server.address().port}`;
+  async function request(path, method = "GET", body, auth, headers = {}) {
+    const response = await fetch(origin + path, { method, headers: { Origin: origin, "Content-Type":"application/json", ...(auth ? { Cookie:auth.cookie, "X-CSRF-Token":auth.csrf } : {}), ...headers }, body: body === undefined ? undefined : JSON.stringify(body) });
+    const result = await response.json();
+    return { status:response.status, ...result, cookie:response.headers.get("set-cookie")?.split(";")[0], setCookie:response.headers.get("set-cookie") };
+  }
+  const stop = async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); };
+  try {
+    assert.equal((await request("/api/archives")).status, 401);
+    assert.equal((await request("/api/login", "POST", {username:"testadmin",password:"wrong"})).status, 401);
+    const admin = await request("/api/login", "POST", {username:"testadmin",password});
+    assert.equal(admin.user.role, "admin");
+    assert.ok(admin.cookie && admin.csrf);
+    assert.match(admin.setCookie, /HttpOnly; SameSite=Strict; Path=\//);
+    assert.doesNotMatch(admin.setCookie, /Max-Age|Expires/i, "login must not issue a persistent cookie");
+    const guest = await request("/api/guest", "POST", {});
+    assert.equal(guest.user.role, "guest");
+    assert.doesNotMatch(guest.setCookie, /Max-Age|Expires/i);
+    assert.equal((await request("/api/archives", "GET", undefined, guest)).records.length, 40);
+    const record = {...seed.records[0], category:seed.columns[0], title:"接口验证档案", abstract:"持久化正文 <script>alert(1)</script>"};
+    assert.equal((await request("/api/archives", "POST", record, guest)).status, 403);
+    assert.equal((await request("/api/users", "POST", { username:"hacker",password,role:"admin" }, guest)).status, 403);
+    assert.equal((await request("/api/archives", "POST", record, admin, { "X-CSRF-Token":"wrong" })).status, 403);
+    assert.equal((await request("/api/archives", "POST", record, admin, { Origin:"https://untrusted.invalid" })).status, 403);
+    assert.equal((await request("/api/archives", "POST", {...record,source:"javascript:alert(1)"}, admin)).status, 400);
+    const readerResult = await request("/api/users", "POST", { username:"testreader",password,role:"admin" }, admin);
+    assert.equal(readerResult.user.role, "reader", "client cannot grant administrator privileges");
+    const reader = await request("/api/login", "POST", {username:"testreader",password});
+    assert.equal(reader.user.role,"reader");
+    assert.equal((await request("/api/archives", "POST",record,reader)).status,403);
+    const markdown = "## 完整正文\n\n```js\nconst x = 1;\n\n  run(x);\n```\n\n| A | B |\n| --- | --- |\n| 1 | 2 |";
+    assert.equal((await request("/api/archives", "POST", { ...record, bodyMarkdown: 123 }, admin)).status, 400);
+    assert.equal((await request("/api/archives", "POST", { ...record, bodyMarkdown: "a".repeat(100001) }, admin)).status, 400);
+    const created = await request("/api/archives", "POST", { ...record, bodyMarkdown: markdown }, admin);
+    assert.equal(created.status,201);
+    assert.equal(created.record.id,"X-041");
+    assert.equal(created.record.bodyMarkdown, markdown);
+    assert.equal((await request("/api/archives", "GET", undefined, guest)).records.find(r => r.id === "X-041").bodyMarkdown, markdown);
+    assert.equal((await request("/api/archives/X-041", "PUT",{...created.record,title:"非法编辑"},reader)).status,403);
+    const edited = await request("/api/archives/X-041","PUT",{...created.record,title:"已编辑"},admin);
+    assert.equal(edited.record.version,2);
+    assert.equal((await request("/api/archives/X-041","PUT",created.record,admin)).status,409);
+    assert.equal((await request("/api/archives/X-041","PUT",{...edited.record,category:seed.columns[1]},admin)).status,400);
+    const additions = await Promise.all(Array.from({length:3}, () => request("/api/archives","POST",record,admin)));
+    assert.equal(new Set(additions.map(x=>x.record.id)).size,3);
+    await stop(); db.close();
+    db = openStore(join(dir,"test.sqlite"));
+    assert.equal(listRecords(db).length,44);
+    assert.equal(listRecords(db).find(r=>r.id==="X-041").title,"已编辑");
+    assert.equal(listRecords(db).find(r=>r.id==="X-041").bodyMarkdown, markdown, "Markdown whitespace survives edit and restart");
+    assert.notEqual(db.prepare("SELECT password_hash FROM users WHERE username='testadmin'").get().password_hash,password);
+    server = createApp({db,now:()=>tick});
+    await new Promise(resolve => server.listen(0,"127.0.0.1",resolve));
+    origin = `http://127.0.0.1:${server.address().port}`;
+    assert.equal((await request("/api/session","GET",undefined,admin)).user.role,"admin");
+    // Entering the site clears old identities even after a server restart.
+    for (const previous of [admin, reader, guest]) {
+      assert.equal((await request("/api/session/reset", "POST", {}, previous, { Origin:"https://untrusted.invalid" })).status, 403);
+      assert.equal((await request("/api/session/reset", "POST", {}, previous, { Origin:"" })).status, 403);
+      assert.ok((await request("/api/session", "GET", undefined, previous)).user);
+      const reset = await request("/api/session/reset", "POST", {}, previous, { "X-CSRF-Token":"" });
+      assert.equal(reset.status, 200);
+      assert.equal(reset.user, null);
+      assert.match(reset.setCookie, /Max-Age=0/);
+      assert.equal((await request("/api/session", "GET", undefined, previous)).user, null);
+      assert.equal((await request("/api/archives", "GET", undefined, previous)).status, 401);
+      assert.equal((await request("/api/archives", "POST", record, previous)).status, 401);
+    }
+    assert.equal((await request("/api/session/reset", "POST", {})).status, 200, "first visit is safe without a cookie");
+    assert.equal((await request("/api/session/reset", "POST", {}, admin)).status, 200, "reset is safe with a revoked cookie");
+    const freshAdmin = await request("/api/login", "POST", { username:"testadmin", password });
+    assert.equal(freshAdmin.user.role, "admin");
+    assert.equal((await request("/api/archives", "GET", undefined, freshAdmin)).status, 200);
+    assert.equal((await request("/api/logout","POST",{},freshAdmin)).status,200);
+    assert.equal((await request("/api/archives","GET",undefined,freshAdmin)).status,401);
+    const freshReader = await request("/api/login", "POST", { username:"testreader", password });
+    const freshGuest = await request("/api/guest", "POST", {});
+    assert.equal(freshReader.user.role, "reader");
+    assert.equal(freshGuest.user.role, "guest");
+    tick += 13*3600000;
+    assert.equal((await request("/api/archives","GET",undefined,freshReader)).status,401);
+    for(let i=0;i<15;i++) await request("/api/login","POST",{username:"missing",password:"invalid"});
+    assert.equal((await request("/api/login","POST",{username:"missing",password:"invalid"})).status,429);
+  } finally { await stop(); db.close(); await rm(dir,{recursive:true,force:true}); }
+});
